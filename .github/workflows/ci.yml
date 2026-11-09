@@ -4,25 +4,49 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+  workflow_dispatch:
 
-env:
-  CARGO_TERM_COLOR: always
+permissions:
+  contents: read
+
+concurrency:
+  # Only PR runs share a group. Every push/dispatch gets its own group so a
+  # newer merge cannot replace a pending ci run.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  test:
+  repo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: No junk, databases or secrets committed
+        run: |
+          bad=$(git ls-files | grep -Ei '(^|/)(\.DS_Store|\.env(\..+)?|[^/]+\.(db|sqlite3?|duckdb|pem|key|p12|pfx))$' | grep -v '\.env\.example$' || true)
+          if [ -n "$bad" ]; then echo "::error::remove from git: $bad"; exit 1; fi
+
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The runner image ships a stable toolchain; no third-party setup action is
+      # needed, which keeps this workflow inside the organization's Actions policy
+      # (GitHub-created actions only).
+      - run: rustup component add clippy rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  # The single check a branch ruleset should require. It passes only if every job above passed.
+  ci:
+    if: always()
+    needs: [repo, rust]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: Check formatting
-        run: cargo fmt --check
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-      - name: Build
-        run: cargo build --verbose
-      - name: Test
-        run: cargo test --verbose
+      - run: test "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}" = false
