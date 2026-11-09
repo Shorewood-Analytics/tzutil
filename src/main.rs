@@ -22,19 +22,43 @@ fn detect_from_etc_timezone(path: &Path) -> Option<String> {
     is_valid_iana_tz(&tz).then_some(tz)
 }
 
+/// Upper bound on symlink hops followed from /etc/localtime (matches Linux's
+/// MAXSYMLINKS), so a link loop terminates instead of spinning forever.
+const MAX_SYMLINK_HOPS: usize = 40;
+
+/// Follows the /etc/localtime symlink chain and returns the zone name from the
+/// first hop whose target is a valid zoneinfo path. Stopping at the first such
+/// hop (rather than canonicalizing) keeps aliases like `US/Mountain` intact.
 fn detect_from_etc_localtime(path: &Path) -> Option<String> {
-    let target = fs::read_link(path).ok()?;
-    let tz = extract_tz_from_zoneinfo_path(&target)?;
-    is_valid_iana_tz(&tz).then_some(tz)
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_SYMLINK_HOPS {
+        let target = fs::read_link(&current).ok()?;
+        if let Some(tz) = extract_tz_from_zoneinfo_path(&target).filter(|tz| is_valid_iana_tz(tz)) {
+            return Some(tz);
+        }
+        // Relative targets are relative to the directory holding the link.
+        current = match current.parent() {
+            Some(dir) => dir.join(&target),
+            None => target,
+        };
+    }
+    None
 }
 
 /// Extracts the IANA timezone name from a zoneinfo path, e.g.
 /// `/usr/share/zoneinfo/America/Denver` -> `America/Denver`.
+///
+/// A leading `posix/` or `right/` directory is dropped, since
+/// `posix/America/Denver` and `right/America/Denver` are not IANA IDs.
 fn extract_tz_from_zoneinfo_path(path: &Path) -> Option<String> {
     const MARKER: &str = "/zoneinfo/";
     let path_str = path.to_str()?;
     let idx = path_str.find(MARKER)?;
     let tz = &path_str[idx + MARKER.len()..];
+    let tz = tz
+        .strip_prefix("posix/")
+        .or_else(|| tz.strip_prefix("right/"))
+        .unwrap_or(tz);
     (!tz.is_empty()).then(|| tz.to_string())
 }
 
@@ -229,6 +253,130 @@ mod tests {
                 detect_from_etc_localtime(&link),
                 Some("America/Los_Angeles".to_string())
             );
+        }
+
+        #[test]
+        fn posix_prefix_is_stripped() {
+            assert_eq!(
+                extract_tz_from_zoneinfo_path(Path::new(
+                    "/usr/share/zoneinfo/posix/America/Denver"
+                )),
+                Some("America/Denver".to_string())
+            );
+            assert_eq!(
+                extract_tz_from_zoneinfo_path(Path::new("../usr/share/zoneinfo/posix/Etc/UTC")),
+                Some("Etc/UTC".to_string())
+            );
+        }
+
+        #[test]
+        fn right_prefix_is_stripped() {
+            assert_eq!(
+                extract_tz_from_zoneinfo_path(Path::new(
+                    "/usr/share/zoneinfo/right/America/Denver"
+                )),
+                Some("America/Denver".to_string())
+            );
+        }
+
+        #[test]
+        fn posix_like_names_are_not_mangled() {
+            assert_eq!(
+                extract_tz_from_zoneinfo_path(Path::new("/usr/share/zoneinfo/posixrules")),
+                Some("posixrules".to_string())
+            );
+            assert_eq!(
+                extract_tz_from_zoneinfo_path(Path::new("/usr/share/zoneinfo/posix/")),
+                None
+            );
+        }
+
+        #[test]
+        fn posix_symlink_end_to_end() {
+            let dir = tempdir().unwrap();
+            let target_dir = dir.path().join("usr/share/zoneinfo/posix/America");
+            fs::create_dir_all(&target_dir).unwrap();
+            let target = target_dir.join("Denver");
+            fs::write(&target, "fake tzdata").unwrap();
+
+            let link = dir.path().join("localtime");
+            symlink(&target, &link).unwrap();
+
+            assert_eq!(
+                detect_from_etc_localtime(&link),
+                Some("America/Denver".to_string())
+            );
+        }
+
+        #[test]
+        fn two_hop_relative_chain_is_followed() {
+            let dir = tempdir().unwrap();
+            let target_dir = dir.path().join("usr/share/zoneinfo/America");
+            fs::create_dir_all(&target_dir).unwrap();
+            let target = target_dir.join("Denver");
+            fs::write(&target, "fake tzdata").unwrap();
+
+            // localtime -> tz-current (relative) -> .../zoneinfo/America/Denver
+            let middle = dir.path().join("tz-current");
+            symlink(&target, &middle).unwrap();
+            let link = dir.path().join("localtime");
+            symlink("tz-current", &link).unwrap();
+
+            assert_eq!(
+                detect_from_etc_localtime(&link),
+                Some("America/Denver".to_string())
+            );
+        }
+
+        #[test]
+        fn three_hop_absolute_chain_is_followed() {
+            let dir = tempdir().unwrap();
+            let target_dir = dir.path().join("usr/share/zoneinfo/Europe");
+            fs::create_dir_all(&target_dir).unwrap();
+            let target = target_dir.join("London");
+            fs::write(&target, "fake tzdata").unwrap();
+
+            let lib = dir.path().join("var/lib");
+            fs::create_dir_all(&lib).unwrap();
+            let second = lib.join("tzlink2");
+            symlink(&target, &second).unwrap();
+            let first = lib.join("tzlink1");
+            symlink(&second, &first).unwrap();
+            let link = dir.path().join("localtime");
+            symlink(&first, &link).unwrap();
+
+            assert_eq!(
+                detect_from_etc_localtime(&link),
+                Some("Europe/London".to_string())
+            );
+        }
+
+        #[test]
+        fn first_zoneinfo_hop_wins_so_aliases_are_kept() {
+            let dir = tempdir().unwrap();
+            let zoneinfo = dir.path().join("usr/share/zoneinfo");
+            fs::create_dir_all(zoneinfo.join("America")).unwrap();
+            fs::create_dir_all(zoneinfo.join("US")).unwrap();
+            fs::write(zoneinfo.join("America/Denver"), "fake tzdata").unwrap();
+            symlink("../America/Denver", zoneinfo.join("US/Mountain")).unwrap();
+
+            let link = dir.path().join("localtime");
+            symlink(zoneinfo.join("US/Mountain"), &link).unwrap();
+
+            assert_eq!(
+                detect_from_etc_localtime(&link),
+                Some("US/Mountain".to_string())
+            );
+        }
+
+        #[test]
+        fn symlink_loop_returns_none() {
+            let dir = tempdir().unwrap();
+            let a = dir.path().join("a");
+            let b = dir.path().join("b");
+            symlink(&b, &a).unwrap();
+            symlink(&a, &b).unwrap();
+            assert_eq!(detect_from_etc_localtime(&a), None);
         }
 
         #[test]
