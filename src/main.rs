@@ -48,17 +48,16 @@ fn detect_from_etc_localtime(path: &Path) -> Option<String> {
 /// Extracts the IANA timezone name from a zoneinfo path, e.g.
 /// `/usr/share/zoneinfo/America/Denver` -> `America/Denver`.
 ///
-/// A leading `posix/` or `right/` directory is dropped, since
-/// `posix/America/Denver` and `right/America/Denver` are not IANA IDs.
+/// A leading `posix/` directory is dropped: `posix/` zones are the plain
+/// zones under another path, and `posix/America/Denver` is not an IANA ID.
+/// `right/` (leap-second) zones are kept as-is on purpose: they keep a
+/// different clock, so stripping them would shift `TZ` by the leap seconds.
 fn extract_tz_from_zoneinfo_path(path: &Path) -> Option<String> {
     const MARKER: &str = "/zoneinfo/";
     let path_str = path.to_str()?;
     let idx = path_str.find(MARKER)?;
     let tz = &path_str[idx + MARKER.len()..];
-    let tz = tz
-        .strip_prefix("posix/")
-        .or_else(|| tz.strip_prefix("right/"))
-        .unwrap_or(tz);
+    let tz = tz.strip_prefix("posix/").unwrap_or(tz);
     (!tz.is_empty()).then(|| tz.to_string())
 }
 
@@ -270,12 +269,12 @@ mod tests {
         }
 
         #[test]
-        fn right_prefix_is_stripped() {
+        fn right_prefix_is_kept() {
             assert_eq!(
                 extract_tz_from_zoneinfo_path(Path::new(
                     "/usr/share/zoneinfo/right/America/Denver"
                 )),
-                Some("America/Denver".to_string())
+                Some("right/America/Denver".to_string())
             );
         }
 
@@ -325,6 +324,28 @@ mod tests {
             assert_eq!(
                 detect_from_etc_localtime(&link),
                 Some("America/Denver".to_string())
+            );
+        }
+
+        #[test]
+        fn relative_hop_resolves_against_its_own_links_directory() {
+            let dir = tempdir().unwrap();
+            let target_dir = dir.path().join("usr/share/zoneinfo/Asia");
+            fs::create_dir_all(&target_dir).unwrap();
+            fs::write(target_dir.join("Tokyo"), "fake tzdata").unwrap();
+
+            // localtime -> var/lib/tz/a (absolute) -> b (relative to var/lib/tz)
+            //   -> ../../../usr/share/zoneinfo/Asia/Tokyo (relative to var/lib/tz)
+            let lib = dir.path().join("var/lib/tz");
+            fs::create_dir_all(&lib).unwrap();
+            symlink("../../../usr/share/zoneinfo/Asia/Tokyo", lib.join("b")).unwrap();
+            symlink("b", lib.join("a")).unwrap();
+            let link = dir.path().join("localtime");
+            symlink(lib.join("a"), &link).unwrap();
+
+            assert_eq!(
+                detect_from_etc_localtime(&link),
+                Some("Asia/Tokyo".to_string())
             );
         }
 
