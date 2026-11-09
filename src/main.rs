@@ -37,10 +37,7 @@ fn detect_from_etc_localtime(path: &Path) -> Option<String> {
             return Some(tz);
         }
         // Relative targets are relative to the directory holding the link.
-        current = match current.parent() {
-            Some(dir) => dir.join(&target),
-            None => target,
-        };
+        current = current.parent().unwrap_or(Path::new("")).join(&target);
     }
     None
 }
@@ -118,7 +115,17 @@ fn main() {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+    use std::path::PathBuf;
     use tempfile::tempdir;
+
+    /// Writes a fake tzdata file at `<root>/usr/share/zoneinfo/<zone>`,
+    /// creating its parent directories, and returns its path.
+    fn fake_zone(root: &Path, zone: &str) -> PathBuf {
+        let path = root.join("usr/share/zoneinfo").join(zone);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "fake tzdata").unwrap();
+        path
+    }
 
     mod is_valid_iana_tz_tests {
         use super::*;
@@ -240,10 +247,7 @@ mod tests {
         #[test]
         fn symlink_target_is_resolved_end_to_end() {
             let dir = tempdir().unwrap();
-            let target_dir = dir.path().join("usr/share/zoneinfo/America");
-            fs::create_dir_all(&target_dir).unwrap();
-            let target = target_dir.join("Los_Angeles");
-            fs::write(&target, "fake tzdata").unwrap();
+            let target = fake_zone(dir.path(), "America/Los_Angeles");
 
             let link = dir.path().join("localtime");
             symlink(&target, &link).unwrap();
@@ -293,10 +297,7 @@ mod tests {
         #[test]
         fn posix_symlink_end_to_end() {
             let dir = tempdir().unwrap();
-            let target_dir = dir.path().join("usr/share/zoneinfo/posix/America");
-            fs::create_dir_all(&target_dir).unwrap();
-            let target = target_dir.join("Denver");
-            fs::write(&target, "fake tzdata").unwrap();
+            let target = fake_zone(dir.path(), "posix/America/Denver");
 
             let link = dir.path().join("localtime");
             symlink(&target, &link).unwrap();
@@ -310,10 +311,7 @@ mod tests {
         #[test]
         fn two_hop_relative_chain_is_followed() {
             let dir = tempdir().unwrap();
-            let target_dir = dir.path().join("usr/share/zoneinfo/America");
-            fs::create_dir_all(&target_dir).unwrap();
-            let target = target_dir.join("Denver");
-            fs::write(&target, "fake tzdata").unwrap();
+            let target = fake_zone(dir.path(), "America/Denver");
 
             // localtime -> tz-current (relative) -> .../zoneinfo/America/Denver
             let middle = dir.path().join("tz-current");
@@ -330,9 +328,7 @@ mod tests {
         #[test]
         fn relative_hop_resolves_against_its_own_links_directory() {
             let dir = tempdir().unwrap();
-            let target_dir = dir.path().join("usr/share/zoneinfo/Asia");
-            fs::create_dir_all(&target_dir).unwrap();
-            fs::write(target_dir.join("Tokyo"), "fake tzdata").unwrap();
+            fake_zone(dir.path(), "Asia/Tokyo");
 
             // localtime -> var/lib/tz/a (absolute) -> b (relative to var/lib/tz)
             //   -> ../../../usr/share/zoneinfo/Asia/Tokyo (relative to var/lib/tz)
@@ -352,10 +348,7 @@ mod tests {
         #[test]
         fn three_hop_absolute_chain_is_followed() {
             let dir = tempdir().unwrap();
-            let target_dir = dir.path().join("usr/share/zoneinfo/Europe");
-            fs::create_dir_all(&target_dir).unwrap();
-            let target = target_dir.join("London");
-            fs::write(&target, "fake tzdata").unwrap();
+            let target = fake_zone(dir.path(), "Europe/London");
 
             let lib = dir.path().join("var/lib");
             fs::create_dir_all(&lib).unwrap();
@@ -376,9 +369,8 @@ mod tests {
         fn first_zoneinfo_hop_wins_so_aliases_are_kept() {
             let dir = tempdir().unwrap();
             let zoneinfo = dir.path().join("usr/share/zoneinfo");
-            fs::create_dir_all(zoneinfo.join("America")).unwrap();
+            fake_zone(dir.path(), "America/Denver");
             fs::create_dir_all(zoneinfo.join("US")).unwrap();
-            fs::write(zoneinfo.join("America/Denver"), "fake tzdata").unwrap();
             symlink("../America/Denver", zoneinfo.join("US/Mountain")).unwrap();
 
             let link = dir.path().join("localtime");
